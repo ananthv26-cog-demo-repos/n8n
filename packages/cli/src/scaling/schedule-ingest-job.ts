@@ -10,6 +10,12 @@ export interface ScheduleIngestJobData {
 	tick: ScheduleTick;
 }
 
+/** Receive metadata the queue hands the worker with each delivery. */
+export interface ScheduleIngestReceipt {
+	attempt: number;
+	maxReceiveCount: number;
+}
+
 /**
  * Runs schedule tick ingest as a redeliverable queue job.
  *
@@ -30,30 +36,25 @@ export class ScheduleIngestJobRunner {
 	 * redelivers the job — a tick whose ingest did not commit must be
 	 * retried, never dropped.
 	 */
-	async run({ jobId, tick }: ScheduleIngestJobData) {
+	async run({ jobId, tick }: ScheduleIngestJobData, receipt: ScheduleIngestReceipt) {
 		try {
 			await this.scheduleIngest.ingestTick(tick);
 		} catch (error) {
-			this.logger.error(this.describeFailure(jobId, tick, error));
+			this.logger.error(this.describeFailure(jobId, tick, receipt));
 			throw error;
 		}
 	}
 
-	private describeFailure(jobId: string, tick: ScheduleTick, error: unknown) {
-		const projects = [...new Set(tick.dueOccurrences.map((o) => o.projectSlug))].join(', ');
-		const cause =
-			error instanceof Error
-				? `${error.name}: ${error.message} (project: ${projects}) ${this.flattenStack(error)}`
-				: `${String(error)} (project: ${projects})`;
-		return `Schedule ingest job ${jobId} (tick ${tick.tickId}) failed, returning to queue: ${cause}`;
-	}
-
-	/** The log pipeline is line-oriented: collapse the stack onto one line. */
-	private flattenStack(error: Error) {
-		return (error.stack ?? '')
-			.split('\n')
-			.slice(1)
-			.map((frame) => frame.trim())
-			.join(' ');
+	/**
+	 * Failure causes from artifact offload can embed tenant resource
+	 * identifiers, and worker logs ship to the shared pipeline — withhold
+	 * the cause entirely and keep the delivery attempt for debuggability.
+	 */
+	private describeFailure(
+		jobId: string,
+		tick: ScheduleTick,
+		{ attempt, maxReceiveCount }: ScheduleIngestReceipt,
+	) {
+		return `Schedule ingest job ${jobId} (tick ${tick.tickId}) failed on attempt ${attempt}/${maxReceiveCount}, returning to queue — cause redacted (may contain tenant data)`;
 	}
 }
