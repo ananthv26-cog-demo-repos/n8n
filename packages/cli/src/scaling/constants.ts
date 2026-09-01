@@ -15,7 +15,9 @@ export const MCP_RELAY_PUBSUB_CHANNEL = 'n8n.mcp-relay';
 
 /**
  * Max allowed size in bytes of a message relayed over the pubsub channel. Events
- * exceeding this are skipped (or trimmed) rather than bloating the channel.
+ * exceeding this are skipped (or trimmed) rather than bloating the channel. The
+ * cap applies to the serialized message, so multi-byte payload fields count at
+ * their encoded size, not their string length.
  */
 export const MAX_PUBSUB_PAYLOAD_BYTES = 5 * 1024 * 1024; // 5 MiB
 
