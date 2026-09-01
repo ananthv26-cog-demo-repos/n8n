@@ -36,17 +36,18 @@ describe('ScheduleIngestJobRunner', () => {
 		expect(logger.error).not.toHaveBeenCalled();
 	});
 
-	it('logs the failure with its cause and rethrows so the queue redelivers', async () => {
-		const error = new Error('upload failed');
+	it('logs the failure with the cause withheld and rethrows so the queue redelivers', async () => {
+		const error = new Error('ProviderError: request rejected by storage backend');
 		error.name = 'S3UploadError';
 		scheduleIngest.ingestTick.mockRejectedValue(error);
 
 		await expect(runner.run({ jobId: 'job-1', tick })).rejects.toThrow(error);
 
 		expect(logger.error).toHaveBeenCalledWith(
-			expect.stringContaining(
-				'Schedule ingest job job-1 (tick tick-1) failed, returning to queue: S3UploadError: upload failed (project: prj-alpha)',
-			),
+			'Schedule ingest job job-1 (tick tick-1) failed, returning to queue — cause redacted (may contain tenant data)',
 		);
+		const [message] = logger.error.mock.calls[0];
+		expect(message).not.toContain(error.message);
+		expect(message).not.toContain(tick.dueOccurrences[0].projectSlug);
 	});
 });

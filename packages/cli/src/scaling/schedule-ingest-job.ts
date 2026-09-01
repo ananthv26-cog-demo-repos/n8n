@@ -34,26 +34,17 @@ export class ScheduleIngestJobRunner {
 		try {
 			await this.scheduleIngest.ingestTick(tick);
 		} catch (error) {
-			this.logger.error(this.describeFailure(jobId, tick, error));
+			this.logger.error(this.describeFailure(jobId, tick));
 			throw error;
 		}
 	}
 
-	private describeFailure(jobId: string, tick: ScheduleTick, error: unknown) {
-		const projects = [...new Set(tick.dueOccurrences.map((o) => o.projectSlug))].join(', ');
-		const cause =
-			error instanceof Error
-				? `${error.name}: ${error.message} (project: ${projects}) ${this.flattenStack(error)}`
-				: `${String(error)} (project: ${projects})`;
-		return `Schedule ingest job ${jobId} (tick ${tick.tickId}) failed, returning to queue: ${cause}`;
-	}
-
-	/** The log pipeline is line-oriented: collapse the stack onto one line. */
-	private flattenStack(error: Error) {
-		return (error.stack ?? '')
-			.split('\n')
-			.slice(1)
-			.map((frame) => frame.trim())
-			.join(' ');
+	/**
+	 * Failure causes from artifact offload can embed tenant resource
+	 * identifiers (bucket names, keys, endpoints), and worker logs ship to
+	 * the shared pipeline — withhold the cause entirely.
+	 */
+	private describeFailure(jobId: string, tick: ScheduleTick) {
+		return `Schedule ingest job ${jobId} (tick ${tick.tickId}) failed, returning to queue — cause redacted (may contain tenant data)`;
 	}
 }
