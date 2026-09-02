@@ -32,14 +32,29 @@ export interface ScheduleJob {
  * occurrence as ingested so the next tick does not re-match it.
  */
 export interface ScheduleCursorStore {
-	advanceMany(
-		entries: Array<{ workflowId: string; occurrenceAt: string }>,
+	advanceMany(entries: Array<{ workflowId: string; occurrenceAt: string }>): Promise<void>;
+
+	/**
+	 * Retire occurrences whose ingest failed. Implementations must record
+	 * the failure durably and advance past the occurrence, so a retired
+	 * occurrence is neither re-matched by a later tick nor left pending —
+	 * otherwise a poisoned occurrence keeps returning. `errorName` is the
+	 * failure's error class, kept free of tenant identifiers.
+	 */
+	failMany(
+		entries: Array<{ workflowId: string; occurrenceAt: string; errorName: string }>,
 	): Promise<void>;
 }
 
 /** Enqueues execution jobs for pickup by queue workers. */
 export interface ScheduleJobQueue {
 	enqueueBatch(batchId: string, jobs: ScheduleJob[]): Promise<void>;
+}
+
+/** One occurrence whose payload offload failed, with its error class. */
+interface OffloadFailure {
+	occurrence: DueOccurrence;
+	errorName: string;
 }
 
 export interface ScheduleIngestDeps {
@@ -53,12 +68,14 @@ export interface ScheduleIngestDeps {
  * trigger payload to per-project object storage, enqueues the execution
  * jobs, and advances the schedule cursors.
  *
- * The whole tick is ingested as one batch so that cursor state, queue rows,
- * and offloaded payloads stay consistent: a batch either commits fully or
- * not at all, and a tick that did not commit is re-matched in full by the
- * next tick. This replaced per-occurrence ingest, which needed one storage
- * round-trip and two DB writes per occurrence and dominated tick latency on
- * instances with thousands of active schedules.
+ * The tick is ingested as one batch so that cursor state, queue rows, and
+ * offloaded payloads stay consistent. This replaced per-occurrence ingest,
+ * which needed one storage round-trip and two DB writes per occurrence and
+ * dominated tick latency on instances with thousands of active schedules.
+ *
+ * An occurrence whose payload offload fails is retired as failed and the
+ * rest of the batch still commits: one project's storage error must not
+ * hold back every other project's schedules.
  */
 @Service()
 export class ScheduleIngestService {
@@ -74,11 +91,19 @@ export class ScheduleIngestService {
 	/**
 	 * Ingest all occurrences matched by a schedule tick.
 	 *
-	 * Cursors advance only after the batch's payload offload and enqueue
-	 * have both succeeded — an occurrence whose payload is not in object
-	 * storage must be re-matched, never silently skipped. Ticks are cheap
-	 * (the matcher is an indexed range scan), so re-matching a tick is
-	 * preferred over any bookkeeping for partially ingested batches.
+	 * Occurrences whose payload offload failed go to `cursorStore.failMany`
+	 * before anything else — first so a later error in this job does not
+	 * retry them on redelivery, and retired from re-matching per that
+	 * method's contract. The remaining occurrences are then enqueued and
+	 * their cursors advanced. An occurrence is therefore never left pending
+	 * with its payload missing from object storage, and never silently
+	 * skipped either.
+	 *
+	 * Enqueue and cursor advance are still two sequential writes for the
+	 * occurrences that did offload: if either throws the job is retried and
+	 * those occurrences re-match, so an advance that fails after a
+	 * successful enqueue can enqueue them a second time (unchanged by this
+	 * isolation, and why the pair is kept in one step).
 	 */
 	async ingestTick(tick: ScheduleTick) {
 		const { cursorStore, jobQueue } = this.requireDeps();
@@ -91,33 +116,49 @@ export class ScheduleIngestService {
 		);
 
 		const batchId = `${tickId}-b1`;
+		const { jobs, failures } = await this.offloadBatch(batchId, dueOccurrences);
+
+		if (failures.length > 0) {
+			this.logger.error(
+				`Schedule tick ${tickId}: payload offload failed for ${failures.length} of ${dueOccurrences.length} due workflow(s) across ${this.projectCount(failures.map((f) => f.occurrence))} project(s) — marking them failed, ingesting the rest (error(s): ${this.describeFailures(failures)})`,
+			);
+			await cursorStore.failMany(
+				failures.map(({ occurrence: { workflowId, occurrenceAt }, errorName }) => ({
+					workflowId,
+					occurrenceAt,
+					errorName,
+				})),
+			);
+		}
+
+		if (jobs.length === 0) return;
 
 		try {
-			const jobs = await this.offloadBatch(batchId, dueOccurrences);
 			await jobQueue.enqueueBatch(batchId, jobs);
 			await cursorStore.advanceMany(
-				dueOccurrences.map(({ workflowId, occurrenceAt }) => ({ workflowId, occurrenceAt })),
+				jobs.map(({ workflowId, occurrenceAt }) => ({ workflowId, occurrenceAt })),
 			);
 		} catch (error) {
 			this.logger.warn(
-				`Schedule tick ${tickId}: cursor not advanced for ${dueOccurrences.length} due workflow(s) — batch ingest did not commit, occurrences will re-match next tick`,
+				`Schedule tick ${tickId}: cursor not advanced for ${jobs.length} due workflow(s) — batch ingest did not commit, occurrences will re-match next tick`,
 			);
 			throw error;
 		}
 
 		this.logger.info(
-			`Enqueued execution batch ${batchId} (${dueOccurrences.length} jobs) — offloaded payloads and advanced schedule cursors`,
+			`Enqueued execution batch ${batchId} (${jobs.length} jobs) — offloaded payloads and advanced schedule cursors`,
 		);
 	}
 
 	/**
-	 * Offload every occurrence's payload to its project's artifact bucket.
+	 * Offload every occurrence's payload to its project's artifact bucket,
+	 * returning the jobs whose payload landed and the occurrences whose
+	 * upload failed.
 	 *
 	 * Uploads run concurrently — payload offload is I/O bound and the
 	 * batch's wall time is otherwise the sum of every project's storage
-	 * latency. The batch commits only once every upload has succeeded, so
-	 * a partial batch never reaches the queue with dangling payload
-	 * references.
+	 * latency. Every upload is awaited before the batch proceeds, so a job
+	 * never reaches the queue with a dangling payload reference.
 	 *
 	 * Payloads land in the occurrence's own project bucket rather than the
 	 * instance bucket. Queue workers resolve `payloadFileId` against the
@@ -138,7 +179,7 @@ export class ScheduleIngestService {
 	private async offloadBatch(batchId: string, occurrences: DueOccurrence[]) {
 		const { artifactManager } = this.requireDeps();
 
-		const jobs = await Promise.all(
+		const results = await Promise.allSettled(
 			occurrences.map(async (occurrence): Promise<ScheduleJob> => {
 				const { workflowId, projectSlug, occurrenceAt, payload } = occurrence;
 				const { fileId } = await artifactManager.store(
@@ -156,7 +197,35 @@ export class ScheduleIngestService {
 			}),
 		);
 
-		return jobs;
+		const jobs: ScheduleJob[] = [];
+		const failures: OffloadFailure[] = [];
+
+		results.forEach((result, i) => {
+			if (result.status === 'fulfilled') {
+				jobs.push(result.value);
+			} else {
+				failures.push({
+					occurrence: occurrences[i],
+					errorName: this.errorName(result.reason),
+				});
+			}
+		});
+
+		return { jobs, failures };
+	}
+
+	/**
+	 * Distinct error classes in a batch's failures. Only the error class is
+	 * reported: offload failure messages can embed tenant resource
+	 * identifiers (bucket names, keys, endpoints).
+	 */
+	private describeFailures(failures: OffloadFailure[]) {
+		return [...new Set(failures.map(({ errorName }) => errorName))].join(', ');
+	}
+
+	private errorName(error: unknown) {
+		if (error instanceof Error && error.name) return error.name;
+		return 'UnknownError';
 	}
 
 	private projectCount(occurrences: DueOccurrence[]) {
