@@ -31,14 +31,12 @@ describe('ScheduleIngestService', () => {
 		service.init({ artifactManager, cursorStore, jobQueue });
 		artifactManager.store.mockResolvedValue({ fileId: 'file-1', fileSize: 2 });
 		cursorStore.advanceMany.mockResolvedValue();
+		cursorStore.markFailed.mockResolvedValue();
 		jobQueue.enqueueBatch.mockResolvedValue();
 	});
 
 	it('offloads every occurrence, enqueues the batch, and advances cursors', async () => {
-		const occurrences = [
-			occurrence(),
-			occurrence({ workflowId: 'wf-2', projectSlug: 'prj-beta' }),
-		];
+		const occurrences = [occurrence(), occurrence({ workflowId: 'wf-2', projectSlug: 'prj-beta' })];
 
 		await service.ingestTick({ tickId: 'tick-1', dueOccurrences: occurrences });
 
@@ -61,20 +59,61 @@ describe('ScheduleIngestService', () => {
 		expect(cursorStore.advanceMany).not.toHaveBeenCalled();
 	});
 
-	it('does not enqueue or advance cursors when an offload fails', async () => {
+	it('marks only the failed occurrence failed and ingests the rest of the tick', async () => {
+		const uploadError = new Error('upload failed');
 		artifactManager.store
 			.mockResolvedValueOnce({ fileId: 'file-1', fileSize: 2 })
-			.mockRejectedValueOnce(new Error('upload failed'));
+			.mockRejectedValueOnce(uploadError)
+			.mockResolvedValueOnce({ fileId: 'file-3', fileSize: 2 });
 
-		await expect(
-			service.ingestTick({
-				tickId: 'tick-3',
-				dueOccurrences: [occurrence(), occurrence({ workflowId: 'wf-2' })],
-			}),
-		).rejects.toThrow('upload failed');
+		await service.ingestTick({
+			tickId: 'tick-3',
+			dueOccurrences: [
+				occurrence(),
+				occurrence({ workflowId: 'wf-2', projectSlug: 'prj_bad' }),
+				occurrence({ workflowId: 'wf-3', projectSlug: 'prj-gamma' }),
+			],
+		});
+
+		expect(jobQueue.enqueueBatch).toHaveBeenCalledWith('tick-3-b1', [
+			expect.objectContaining({ workflowId: 'wf-1', payloadFileId: 'file-1' }),
+			expect.objectContaining({ workflowId: 'wf-3', payloadFileId: 'file-3' }),
+		]);
+		expect(cursorStore.advanceMany).toHaveBeenCalledWith([
+			{ workflowId: 'wf-1', occurrenceAt: '2025-06-01T00:00:00.000Z' },
+			{ workflowId: 'wf-3', occurrenceAt: '2025-06-01T00:00:00.000Z' },
+		]);
+		expect(cursorStore.markFailed).toHaveBeenCalledWith([
+			{ workflowId: 'wf-2', occurrenceAt: '2025-06-01T00:00:00.000Z', error: uploadError },
+		]);
+		expect(logger.warn).toHaveBeenCalledWith(expect.not.stringContaining('prj_bad'));
+	});
+
+	it('marks every occurrence failed without enqueueing when all offloads fail', async () => {
+		artifactManager.store.mockRejectedValue(new Error('upload failed'));
+
+		await service.ingestTick({
+			tickId: 'tick-5',
+			dueOccurrences: [occurrence(), occurrence({ workflowId: 'wf-2' })],
+		});
 
 		expect(jobQueue.enqueueBatch).not.toHaveBeenCalled();
 		expect(cursorStore.advanceMany).not.toHaveBeenCalled();
+		expect(cursorStore.markFailed).toHaveBeenCalledWith([
+			expect.objectContaining({ workflowId: 'wf-1' }),
+			expect.objectContaining({ workflowId: 'wf-2' }),
+		]);
+	});
+
+	it('fails the tick without advancing cursors when enqueue fails', async () => {
+		jobQueue.enqueueBatch.mockRejectedValue(new Error('queue unavailable'));
+
+		await expect(
+			service.ingestTick({ tickId: 'tick-6', dueOccurrences: [occurrence()] }),
+		).rejects.toThrow('queue unavailable');
+
+		expect(cursorStore.advanceMany).not.toHaveBeenCalled();
+		expect(cursorStore.markFailed).not.toHaveBeenCalled();
 	});
 
 	it('throws when used before init', async () => {
